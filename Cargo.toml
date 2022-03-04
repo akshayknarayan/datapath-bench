@@ -1,0 +1,22 @@
+[package]
+name = "datapath-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dpdk-wrapper = { path = "../dpdk-direct/dpdk-wrapper" }
+shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
+color-eyre = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.2"
+tracing-error = "0.1"
+tracing-futures = "0.2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+structopt = "0.3"
+futures-util = "0.3"
+flume = "0.10"
+criterion = "0.3"
+rand = "0.8"
+quanta = "0.9"
