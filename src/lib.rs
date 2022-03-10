@@ -1,7 +1,42 @@
 use color_eyre::eyre::{bail, Report};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddrV4;
 use std::str::FromStr;
 use std::time::Duration;
+use structopt::StructOpt;
+
+mod dpdk;
+pub use dpdk::{dpdk_client, dpdk_server};
+
+#[derive(Debug, Clone, StructOpt)]
+pub struct Client {
+    #[structopt(short, long)]
+    pub addr: SocketAddrV4,
+
+    #[structopt(short, long)]
+    pub num_reqs: usize,
+
+    #[structopt(short, long)]
+    pub conn_count: usize,
+
+    #[structopt(short, long)]
+    pub load_req_per_s: usize,
+
+    #[structopt(long, default_value = "imm")]
+    pub req_work_type: Work,
+
+    #[structopt(long, default_value = "0")]
+    pub req_work_disparity: usize,
+
+    #[structopt(long, default_value = "0")]
+    pub req_padding_size: usize,
+}
+
+#[derive(Debug, Clone, StructOpt)]
+pub struct Server {
+    #[structopt(short, long)]
+    pub port: u16,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Work {
