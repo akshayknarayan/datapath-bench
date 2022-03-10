@@ -59,24 +59,7 @@ async fn dpdk_server_inner(
         );
 
         let Req { wrk, client_time } = bincode::deserialize(&buf[8..(8 + sz)])?;
-        match wrk {
-            Work::Immediate => (),
-            Work::BusyWork(amt) => {
-                // copy from shenango:
-                // https://github.com/shenango/shenango/blob/master/apps/synthetic/src/fakework.rs#L54
-                let k = 2350845.545;
-                for i in 0..amt {
-                    criterion::black_box(f64::sqrt(k * i as f64));
-                }
-            }
-            Work::Memory(amt) => {
-                for i in 0..(amt as usize) {
-                    criterion::black_box(
-                        access_buf[access_buf[i % access_buf.len()] % access_buf.len()],
-                    );
-                }
-            }
-        }
+        wrk.work(access_buf);
 
         let now = clk.end();
         Ok(Resp {
