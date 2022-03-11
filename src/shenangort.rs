@@ -1,19 +1,18 @@
-use super::{Client, DoneResp, Req, Resp, Server, Work, WorkGenerator};
-use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
-use futures_util::stream::StreamExt;
+use super::{write_results, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator};
+use color_eyre::eyre::{ensure, Report, WrapErr};
 use shenango::sync::Mutex;
 use shenango::udp::{self, UdpConnection};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
-use tracing::{debug, info, info_span, trace, warn};
+use tracing::{debug, info, warn};
 
 pub fn shenango_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
-    info!("KV Server, no chunnels");
+    info!(?cfg, ?port, "starting server");
     shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
         server(port).unwrap();
     })
@@ -26,10 +25,11 @@ fn server(port: u16) -> Result<(), Report> {
 
     let idx = Arc::new(AtomicUsize::new(0));
     udp::udp_accept(bind_addr, move |cn| {
-        let idx = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let idx = idx.fetch_add(1, Ordering::SeqCst);
         server_conn(cn, idx).unwrap()
     })
-    .unwrap()
+    .unwrap();
+    Ok(())
 }
 
 fn server_conn(cn: UdpConnection, idx: usize) -> Result<(), Report> {
@@ -46,11 +46,11 @@ fn server_conn(cn: UdpConnection, idx: usize) -> Result<(), Report> {
     let mut buf = [0u8; 2048];
     loop {
         let len = cn.recv(&mut buf)?;
-        let buf = buf[..len];
+        let rbuf = &buf[..len];
 
         let then = clk.start();
         ensure!(len > 8, "msg too short: {} < 8", buf.len());
-        let sz = u64::from_be_bytes(buf[0..8].try_into().unwrap()) as usize;
+        let sz = u64::from_be_bytes(rbuf[0..8].try_into().unwrap()) as usize;
         ensure!(
             len >= 8 + sz,
             "msg too short for declared size: {} < {}",
@@ -58,7 +58,7 @@ fn server_conn(cn: UdpConnection, idx: usize) -> Result<(), Report> {
             8 + sz
         );
 
-        let Req { wrk, client_time } = bincode::deserialize(&buf[8..(8 + sz)])?;
+        let Req { wrk, client_time } = bincode::deserialize(&rbuf[8..(8 + sz)])?;
         wrk.work(&access_buf[..]);
         let now = clk.end();
         let resp = Resp {
@@ -66,7 +66,7 @@ fn server_conn(cn: UdpConnection, idx: usize) -> Result<(), Report> {
             client_time,
         };
 
-        let sz = bincode::serialized_size(&rsp)? as usize;
+        let sz = bincode::serialized_size(&resp)? as usize;
         buf[0..8].copy_from_slice(&sz.to_be_bytes());
         bincode::serialize_into(&mut buf[8..(8 + sz)], &resp)?;
         if let Err(e) = cn.send(&buf[..(8 + sz)]) {
@@ -76,8 +76,26 @@ fn server_conn(cn: UdpConnection, idx: usize) -> Result<(), Report> {
     }
 }
 
-pub fn shenango_client(
-    cfg: PathBuf,
+pub fn shenango_client(cfg: PathBuf, out_file: Option<PathBuf>, c: Client) -> Result<(), Report> {
+    info!(?cfg, ?c, "starting client");
+    let load = c.load_req_per_s;
+    let tot_reqs = c.num_reqs;
+    let clk = quanta::Clock::new();
+    let then = clk.start();
+    shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
+        let durs = shenango_client_inner(c).unwrap();
+
+        let now = clk.end();
+        let elapsed = clk.delta(then, now);
+        let remaining = tot_reqs - durs.len();
+        write_results(durs, remaining, elapsed, load, out_file);
+        std::process::exit(0);
+    })
+    .unwrap();
+    Ok(())
+}
+
+fn shenango_client_inner(
     Client {
         addr,
         num_reqs,
@@ -94,14 +112,15 @@ pub fn shenango_client(
     let (done_s, done_r) = flume::bounded(conn_count);
 
     for _ in 0..conn_count {
-        let cn = UdpConnection::dial(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0), addr)?;
+        let cn = UdpConnection::dial(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0), addr)
+            .unwrap();
         let wg = work_gen.clone();
         let timer = Timer::new(req_interarrival);
         let ops = wg.take(num_reqs / conn_count);
         let done = done_s.clone();
 
         shenango::thread::spawn_detached(move || {
-            shenango_client_thread(cn, ops, timer, req_padding_size, done_s)
+            shenango_client_thread(cn, ops, timer, req_padding_size, done)
         });
     }
 
@@ -131,7 +150,7 @@ fn shenango_client_thread(
 fn shenango_client_thread_inner(
     cn: UdpConnection,
     ops: impl Iterator<Item = Work>,
-    ticker: Timer,
+    mut ticker: Timer,
     req_padding_size: usize,
 ) -> Result<Vec<DoneResp>, Report> {
     fn send_req(
@@ -150,7 +169,7 @@ fn shenango_client_thread_inner(
         buf[0..8].copy_from_slice(&sz.to_be_bytes());
         bincode::serialize_into(&mut buf[8..(8 + sz) as usize], &req)?;
 
-        cn.send(buf)?;
+        cn.send(&buf[..(8 + sz + req_padding_size as u64) as usize])?;
         Ok(())
     }
 
@@ -179,30 +198,34 @@ fn shenango_client_thread_inner(
     let clk = quanta::Clock::new();
     let done = Arc::new(AtomicBool::new(false));
     let done_reqs = Arc::new(Mutex::new(Vec::with_capacity(1024 * 1024)));
-    let send_clk = clk.clone();
-    let send_cn = cn.clone();
+
+    let r_done = Arc::clone(&done);
+    let recv_clk = clk.clone();
+    let recv_cn = cn.clone();
     let r_done_reqs = Arc::clone(&done_reqs);
     shenango::thread::spawn(move || {
         let done_reqs = r_done_reqs;
         loop {
-            if done.load(Ordering::SeqCst) {
-                debug!(?client_id, "exiting");
+            if r_done.load(Ordering::SeqCst) {
+                debug!("exiting");
                 break;
             }
 
-            let resp = recv_resp(&cn, &clk)?;
-            done_reqs.lock().push(resp);
+            if let Ok(resp) = recv_resp(&recv_cn, &recv_clk) {
+                done_reqs.lock().push(resp);
+            }
         }
     });
 
     let mut buf = [0u8; 2048];
     for w in ops {
         ticker.wait();
-        send_req(&send_cn, &clk, &mut buf, w, req_padding_size);
+        send_req(&cn, &clk, &mut buf, w, req_padding_size)?;
     }
 
     done.store(true, Ordering::SeqCst);
-    Ok(done_reqs.lock().clone())
+    let dr = done_reqs.lock();
+    Ok(dr.clone())
 }
 
 struct Timer {

@@ -1,4 +1,6 @@
-use super::{AsyncSpinTimer, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator};
+use super::{
+    write_results, AsyncSpinTimer, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator,
+};
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::DpdkConn;
 use futures_util::stream::StreamExt;
@@ -118,6 +120,7 @@ async fn dpdk_server_inner(
 
 pub fn dpdk_client(
     cfg: PathBuf,
+    out_file: Option<PathBuf>,
     Client {
         addr,
         num_reqs,
@@ -127,7 +130,9 @@ pub fn dpdk_client(
         req_work_disparity,
         req_padding_size,
     }: Client,
-) -> Result<Vec<DoneResp>, Report> {
+) -> Result<(), Report> {
+    let clk = quanta::Clock::new();
+    let then = clk.start();
     let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
 
@@ -135,7 +140,7 @@ pub fn dpdk_client(
         .worker_threads(4)
         .enable_all()
         .build()?;
-    rt.block_on(async move {
+    let durs: Result<Vec<_>, Report> = rt.block_on(async move {
         let handle = dpdk_raw_start_iokernel(cfg).await?;
         let cns = (0..conn_count)
             .map(|_| {
@@ -151,15 +156,26 @@ pub fn dpdk_client(
             .collect::<Result<_, Report>>();
         let cns: Vec<_> = cns?;
         let r = futures_util::future::try_join_all(cns.into_iter().enumerate().map(
-            |(i, (cn, ops))| {
-                dpdk_client_thread(cn, Box::pin(ops), req_padding_size, addr)
-                    .instrument(info_span!("dpdk_client_thread", client_id=?i))
+            |(i, (cn, ops))| async move {
+                let jh = tokio::spawn(
+                    dpdk_client_thread(cn, Box::pin(ops), req_padding_size, addr)
+                        .instrument(info_span!("dpdk_client_thread", client_id=?i)),
+                );
+                jh.await.unwrap()
             },
         ))
         .await;
         let durs = r?.into_iter().flat_map(|x| x.into_iter()).collect();
         Ok(durs)
-    })
+    });
+
+    let durs = durs?;
+
+    let now = clk.end();
+    let elapsed = clk.delta(then, now);
+    let remaining = num_reqs - durs.len();
+    write_results(durs, remaining, elapsed, load_req_per_s, out_file);
+    Ok(())
 }
 
 async fn dpdk_client_thread(

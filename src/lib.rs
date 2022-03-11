@@ -1,12 +1,18 @@
 use color_eyre::eyre::{bail, Report};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddrV4;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use structopt::StructOpt;
+use tracing::info;
 
 mod dpdk;
 pub use dpdk::{dpdk_client, dpdk_server};
+
+mod shenangort;
+pub use shenangort::{shenango_client, shenango_server};
 
 #[derive(Debug, Clone, StructOpt)]
 pub struct Client {
@@ -107,27 +113,15 @@ pub struct DoneResp {
 }
 
 #[derive(Debug, Clone)]
-pub enum WorkGenerator<R> {
+pub enum WorkGenerator {
     Immediate,
-    BusyWork {
-        rng: R,
-        range_start: u64,
-        range_end: u64,
-    },
-    BusyWorkConst {
-        mean: u64,
-    },
-    Memory {
-        rng: R,
-        range_start: u64,
-        range_end: u64,
-    },
-    MemoryConst {
-        mean: u64,
-    },
+    BusyWork { range_start: u64, range_end: u64 },
+    BusyWorkConst { mean: u64 },
+    Memory { range_start: u64, range_end: u64 },
+    MemoryConst { mean: u64 },
 }
 
-impl WorkGenerator<rand::rngs::ThreadRng> {
+impl WorkGenerator {
     pub fn new(w: Work, disparity: usize) -> Self {
         match (w, disparity) {
             (Work::Immediate, _) => Self::Immediate,
@@ -135,7 +129,6 @@ impl WorkGenerator<rand::rngs::ThreadRng> {
             (Work::BusyWork(mean), disparity) => {
                 let range_start = mean - ((disparity / 2) as u64);
                 Self::BusyWork {
-                    rng: rand::thread_rng(),
                     range_start,
                     range_end: range_start + disparity as u64,
                 }
@@ -144,7 +137,6 @@ impl WorkGenerator<rand::rngs::ThreadRng> {
             (Work::Memory(mean), disparity) => {
                 let range_start = mean - ((disparity / 2) as u64);
                 Self::Memory {
-                    rng: rand::thread_rng(),
                     range_start,
                     range_end: range_start + disparity as u64,
                 }
@@ -153,21 +145,19 @@ impl WorkGenerator<rand::rngs::ThreadRng> {
     }
 }
 
-impl<R: rand::Rng> Iterator for WorkGenerator<R> {
+impl Iterator for WorkGenerator {
     type Item = Work;
     fn next(&mut self) -> Option<Self::Item> {
         Some(match self {
             WorkGenerator::Immediate => Work::Immediate,
             WorkGenerator::BusyWork {
-                rng,
                 range_start,
                 range_end,
-            } => Work::BusyWork(rng.gen_range(*range_start..*range_end)),
+            } => Work::BusyWork(rand::thread_rng().gen_range(*range_start..*range_end)),
             WorkGenerator::Memory {
-                rng,
                 range_start,
                 range_end,
-            } => Work::Memory(rng.gen_range(*range_start..*range_end)),
+            } => Work::Memory(rand::thread_rng().gen_range(*range_start..*range_end)),
             WorkGenerator::BusyWorkConst { mean } => Work::BusyWork(*mean),
             WorkGenerator::MemoryConst { mean } => Work::Memory(*mean),
         })
@@ -221,5 +211,88 @@ impl AsyncSpinTimer {
                 ((), this)
             })
         })
+    }
+}
+
+fn write_results(
+    reqs: Vec<DoneResp>,
+    remaining_inflight: usize,
+    time: Duration,
+    attempted_load_req_per_sec: usize,
+    out_file: Option<PathBuf>,
+) {
+    let mut durs: Vec<_> = reqs
+        .clone()
+        .into_iter()
+        .map(|DoneResp { duration, .. }| duration)
+        .collect();
+    durs.sort();
+    let len = durs.len() as f64;
+    let quantile_idxs = [0.25, 0.5, 0.75, 0.95];
+    let quantiles: Vec<_> = quantile_idxs
+        .iter()
+        .map(|q| (len * q) as usize)
+        .map(|i| durs[i])
+        .collect();
+    let num = durs.len() as f64;
+    let achieved_load_req_per_sec = (num as f64) / time.as_secs_f64();
+    let offered_load_req_per_sec = (num + remaining_inflight as f64) / time.as_secs_f64();
+    info!(
+        num = ?&durs.len(), elapsed = ?time, ?remaining_inflight,
+        ?achieved_load_req_per_sec, ?offered_load_req_per_sec, ?attempted_load_req_per_sec,
+        min = ?durs[0], p25 = ?quantiles[0], p50 = ?quantiles[1],
+        p75 = ?quantiles[2], p95 = ?quantiles[3], max = ?durs[durs.len() - 1],
+        "Did accesses"
+    );
+
+    println!(
+        "Did accesses:\
+        num = {:?},\
+        elapsed_sec = {:?},\
+        remaining_inflight = {:?},\
+        achieved_load_req_per_sec = {:?},\
+        offered_load_req_per_sec = {:?},\
+        attempted_load_req_per_sec = {:?},\
+        min_us = {:?},\
+        p25_us = {:?},\
+        p50_us = {:?},\
+        p75_us = {:?},\
+        p95_us = {:?},\
+        max_us = {:?}",
+        durs.len(),
+        time.as_secs_f64(),
+        remaining_inflight,
+        achieved_load_req_per_sec,
+        offered_load_req_per_sec,
+        attempted_load_req_per_sec,
+        durs[0].as_micros(),
+        quantiles[0].as_micros(),
+        quantiles[1].as_micros(),
+        quantiles[2].as_micros(),
+        quantiles[3].as_micros(),
+        durs[durs.len() - 1].as_micros(),
+    );
+
+    if let Some(f) = out_file {
+        let mut f = std::fs::File::create(f).expect("Open out file");
+        use std::io::Write;
+        writeln!(
+            &mut f,
+            "Offered_load_rps NumOps Completion_ms Latency_us Server_us"
+        )
+        .expect("write");
+        let len = reqs.len();
+        for DoneResp { srv_time, duration } in reqs {
+            writeln!(
+                &mut f,
+                "{} {} {} {} {}",
+                attempted_load_req_per_sec,
+                len,
+                time.as_millis(),
+                duration.as_micros(),
+                srv_time.as_micros()
+            )
+            .expect("write");
+        }
     }
 }
