@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use structopt::StructOpt;
-use tracing::info;
+use tracing::{error, info};
 
 mod dpdk;
 pub use dpdk::{dpdk_client, dpdk_server};
@@ -221,6 +221,11 @@ fn write_results(
     attempted_load_req_per_sec: usize,
     out_file: Option<PathBuf>,
 ) {
+    if reqs.is_empty() {
+        error!("no requests finished");
+        return;
+    }
+
     let mut durs: Vec<_> = reqs
         .clone()
         .into_iter()

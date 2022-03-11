@@ -9,12 +9,17 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub fn shenango_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
     info!(?cfg, ?port, "starting server");
     shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
-        server(port).unwrap();
+        if let Err(err) = server(port) {
+            error!(?err, "server errored");
+            std::process::exit(1);
+        } else {
+            unreachable!()
+        }
     })
     .unwrap();
     Ok(())
@@ -22,13 +27,15 @@ pub fn shenango_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Repo
 
 fn server(port: u16) -> Result<(), Report> {
     let bind_addr = SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
-
     let idx = Arc::new(AtomicUsize::new(0));
+    info!(?bind_addr, "listening");
     udp::udp_accept(bind_addr, move |cn| {
         let idx = idx.fetch_add(1, Ordering::SeqCst);
-        server_conn(cn, idx).unwrap()
+        if let Err(err) = server_conn(cn, idx) {
+            warn!(?err, "server conn failed");
+        }
     })
-    .unwrap();
+    .wrap_err("udp_accept failed")?;
     Ok(())
 }
 
@@ -83,12 +90,19 @@ pub fn shenango_client(cfg: PathBuf, out_file: Option<PathBuf>, c: Client) -> Re
     let clk = quanta::Clock::new();
     let then = clk.start();
     shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
-        let durs = shenango_client_inner(c).unwrap();
+        match shenango_client_inner(c) {
+            Ok(durs) => {
+                let now = clk.end();
+                let elapsed = clk.delta(then, now);
+                let remaining = tot_reqs - durs.len();
+                write_results(durs, remaining, elapsed, load, out_file);
+            }
+            Err(err) => {
+                error!(?err, "client failed");
+            }
+        }
 
-        let now = clk.end();
-        let elapsed = clk.delta(then, now);
-        let remaining = tot_reqs - durs.len();
-        write_results(durs, remaining, elapsed, load, out_file);
+        info!("exiting");
         std::process::exit(0);
     })
     .unwrap();
@@ -111,7 +125,7 @@ fn shenango_client_inner(
 
     let (done_s, done_r) = flume::bounded(conn_count);
 
-    for _ in 0..conn_count {
+    for i in 0..conn_count {
         let cn = UdpConnection::dial(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0), addr)
             .unwrap();
         let wg = work_gen.clone();
@@ -119,8 +133,9 @@ fn shenango_client_inner(
         let ops = wg.take(num_reqs / conn_count);
         let done = done_s.clone();
 
+        info!(?i, "starting client thread");
         shenango::thread::spawn_detached(move || {
-            shenango_client_thread(cn, ops, timer, req_padding_size, done)
+            shenango_client_thread(cn, ops, timer, req_padding_size, done, i)
         });
     }
 
@@ -142,8 +157,12 @@ fn shenango_client_thread(
     ticker: Timer,
     req_padding_size: usize,
     done: flume::Sender<Result<Vec<DoneResp>, Report>>,
+    i: usize,
 ) {
-    let res = shenango_client_thread_inner(cn, ops, ticker, req_padding_size);
+    let res = shenango_client_thread_inner(cn, ops, ticker, req_padding_size, i);
+    if let Err(ref e) = &res {
+        warn!(?i, ?e, "client thread failed");
+    }
     done.send(res).unwrap();
 }
 
@@ -152,6 +171,7 @@ fn shenango_client_thread_inner(
     ops: impl Iterator<Item = Work>,
     mut ticker: Timer,
     req_padding_size: usize,
+    i: usize,
 ) -> Result<Vec<DoneResp>, Report> {
     fn send_req(
         cn: &UdpConnection,
@@ -195,19 +215,20 @@ fn shenango_client_thread_inner(
         })
     }
 
+    let cn = Arc::new(cn);
     let clk = quanta::Clock::new();
     let done = Arc::new(AtomicBool::new(false));
     let done_reqs = Arc::new(Mutex::new(Vec::with_capacity(1024 * 1024)));
 
     let r_done = Arc::clone(&done);
     let recv_clk = clk.clone();
-    let recv_cn = cn.clone();
+    let recv_cn = Arc::clone(&cn);
     let r_done_reqs = Arc::clone(&done_reqs);
     shenango::thread::spawn(move || {
         let done_reqs = r_done_reqs;
         loop {
             if r_done.load(Ordering::SeqCst) {
-                debug!("exiting");
+                info!(?i, "exiting recvs");
                 break;
             }
 
@@ -217,13 +238,15 @@ fn shenango_client_thread_inner(
         }
     });
 
+    info!(?i, "starting sending ops");
     let mut buf = [0u8; 2048];
     for w in ops {
         ticker.wait();
-        send_req(&cn, &clk, &mut buf, w, req_padding_size)?;
+        send_req(&cn, &clk, &mut buf, w, req_padding_size).wrap_err("send req")?;
     }
 
     done.store(true, Ordering::SeqCst);
+    debug!(?i, "finished sending ops");
     let dr = done_reqs.lock();
     Ok(dr.clone())
 }

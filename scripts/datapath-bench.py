@@ -11,15 +11,15 @@ import threading
 import time
 import toml
 
-#def write_shenango_config(conn):
-#    shenango_config = f"""
-#host_addr {conn.addr}
-#host_netmask 255.255.255.0
-#host_gateway 10.1.1.1
-#runtime_kthreads 4
-#runtime_spininng_kthreads 4
-#runtime_guaranteed_kthreads 4"""
-#    write_cfg(conn, shenango_config)
+def write_shenango_config(conn):
+    shenango_config = f"""
+host_addr {conn.addr}
+host_netmask 255.255.255.0
+host_gateway 10.1.1.1
+runtime_kthreads 4
+runtime_spininng_kthreads 4
+runtime_guaranteed_kthreads 4"""
+    write_cfg(conn, shenango_config)
 
 def setup_machine(conn, outdir):
     ok = conn.run(f"mkdir -p ~/burrito/{outdir}")
@@ -34,17 +34,16 @@ dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-
 def start_server(conn, outf, variant='dpdk'):
     conn.run("sudo pkill -9 datapath-bench")
     if 'shenango' in variant:
-        #conn.run("sudo pkill -INT iokerneld")
-        #write_shenango_config(conn)
-        #conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-        raise Exception("no shenango currently")
+        conn.run("sudo pkill -INT iokerneld")
+        write_shenango_config(conn)
+        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     elif 'dpdk' in variant:
         write_dpdk_config(conn)
     else:
         raise Exception("unknown datapath")
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=info {dpdk_ld_var} ./target/release/datapath-bench --cfg host.config server -p 4242",
+    ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} ./target/release/datapath-bench --cfg host.config --datapath {variant} server -p 4242",
         wd="~/burrito",
         sudo=True,
         background=True,
@@ -59,10 +58,9 @@ def start_server(conn, outf, variant='dpdk'):
 def run_client(conn, server, load, num_clients, num_reqs, work_type, work_disparity, req_padding, variant, outf):
     conn.run("sudo pkill -9 datapath-bench")
     if 'shenango' in variant:
-        #conn.run("sudo pkill -INT iokerneld")
-        #write_shenango_config(conn)
-        #conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
-        raise Exception("no shenango currently")
+        conn.run("sudo pkill -INT iokerneld")
+        write_shenango_config(conn)
+        conn.run("./iokerneld", wd="~/burrito/shenango-chunnel/caladan", sudo=True, background=True)
     elif 'dpdk' in variant:
         write_dpdk_config(conn)
     else:
@@ -71,8 +69,9 @@ def run_client(conn, server, load, num_clients, num_reqs, work_type, work_dispar
     time.sleep(2)
     agenda.subtask(f"client starting -> {outf}.out")
     ok = conn.run(
-        f"RUST_LOG=info {dpdk_ld_var} ./target/release/datapath-bench \
+        f"RUST_LOG=debug {dpdk_ld_var} ./target/release/datapath-bench \
         --cfg host.config \
+        --datapath {variant} \
         --out-file={outf}.data \
         client \
         -a {server}:4242 \
@@ -294,6 +293,9 @@ if __name__ == '__main__':
         for nc in cfg['exp']['num_clients']:
             for w in cfg['exp']['work_type']:
                 for d in cfg['exp']['work_disparity']:
+                    if w == 'imm' and int(d) != 0:
+                        agenda.subtask('skipping nonzero disparity for imm work')
+                        continue
                     for p in cfg['exp']['req_padding']:
                         for l in cfg['exp']['load']:
                             nr = int(cfg['exp']['time_target_s']) * int(l)
