@@ -1,4 +1,5 @@
 use color_eyre::eyre::{bail, Report};
+use quanta::Instant;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddrV4;
@@ -165,28 +166,36 @@ impl Iterator for WorkGenerator {
 }
 
 pub struct AsyncSpinTimer {
+    clk: quanta::Clock,
     interarrival: Duration,
     deficit: Duration,
+    last_return: Option<Instant>,
 }
 
 impl AsyncSpinTimer {
     pub fn new(interarrival: Duration) -> Self {
         AsyncSpinTimer {
+            clk: quanta::Clock::new(),
             interarrival,
             deficit: Duration::from_micros(0),
+            last_return: None,
         }
     }
 
     pub async fn wait(&mut self) {
-        let start = tokio::time::Instant::now();
         if self.deficit > self.interarrival {
             self.deficit -= self.interarrival;
+            self.last_return = Some(self.clk.now());
             return;
         }
 
-        let target = start + self.interarrival;
+        if self.last_return.is_none() {
+            self.last_return = Some(self.clk.now());
+        }
+
+        let target = self.last_return.unwrap() + self.interarrival;
         loop {
-            let now = tokio::time::Instant::now();
+            let now = self.clk.now();
             if now >= target {
                 break;
             }
@@ -198,10 +207,12 @@ impl AsyncSpinTimer {
             }
         }
 
-        let elapsed = tokio::time::Instant::now() - start;
+        let elapsed = self.clk.now() - self.last_return.unwrap();
         if elapsed > self.interarrival {
             self.deficit += elapsed - self.interarrival;
         }
+
+        self.last_return = Some(self.clk.now());
     }
 
     pub fn into_stream(self) -> impl futures_util::stream::Stream<Item = ()> {

@@ -148,6 +148,7 @@ fn shenango_client_inner(
         durs.extend(thread_durs);
     }
 
+    info!(num_reqs = ?durs.len(), "done");
     Ok(durs)
 }
 
@@ -254,6 +255,7 @@ fn shenango_client_thread_inner(
 struct Timer {
     interarrival: Duration,
     deficit: Duration,
+    last_return: Option<u64>,
 }
 
 impl Timer {
@@ -261,18 +263,23 @@ impl Timer {
         Timer {
             interarrival,
             deficit: Duration::from_micros(0),
+            last_return: None,
         }
     }
 
     fn wait(&mut self) {
-        let start = shenango::microtime();
         if self.deficit > self.interarrival {
             self.deficit -= self.interarrival;
+            self.last_return = Some(shenango::microtime());
             return;
         }
 
+        if self.last_return.is_none() {
+            self.last_return = Some(shenango::microtime());
+        }
+
         let interarrival_us = self.interarrival.as_micros() as u64;
-        let target = start + interarrival_us;
+        let target = self.last_return.unwrap() + interarrival_us;
 
         loop {
             let now = shenango::microtime();
@@ -287,9 +294,11 @@ impl Timer {
             }
         }
 
-        let elapsed = shenango::microtime() - start;
+        let elapsed = shenango::microtime() - self.last_return.unwrap();
         if elapsed > interarrival_us {
             self.deficit += Duration::from_micros(elapsed - interarrival_us);
         }
+
+        self.last_return = Some(shenango::microtime());
     }
 }

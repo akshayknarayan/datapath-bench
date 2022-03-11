@@ -170,6 +170,7 @@ pub fn dpdk_client(
     });
 
     let durs = durs?;
+    info!(num_reqs = ?durs.len(), "done");
 
     let now = clk.end();
     let elapsed = clk.delta(then, now);
