@@ -12,6 +12,9 @@ use tracing::{error, info};
 mod dpdk;
 pub use dpdk::{dpdk_client, dpdk_server};
 
+mod dpdk_inline;
+pub use dpdk_inline::{dpdk_inline_client, dpdk_inline_server};
+
 mod shenangort;
 pub use shenangort::{shenango_client, shenango_server};
 
