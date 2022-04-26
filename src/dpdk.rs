@@ -132,7 +132,6 @@ pub fn dpdk_client(
     }: Client,
 ) -> Result<(), Report> {
     let clk = quanta::Clock::new();
-    let then = clk.start();
     let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
 
@@ -140,6 +139,7 @@ pub fn dpdk_client(
         .worker_threads(4)
         .enable_all()
         .build()?;
+    let then = clk.start();
     let durs: Result<Vec<_>, Report> = rt.block_on(async move {
         let handle = dpdk_raw_start_iokernel(cfg).await?;
         let cns = (0..conn_count)

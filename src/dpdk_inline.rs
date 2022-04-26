@@ -1,4 +1,6 @@
-use crate::{Client, Req, Resp, Server};
+use crate::{
+    write_results, AsyncSpinTimer, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator,
+};
 use ahash::AHashMap as HashMap;
 use color_eyre::eyre::{bail, ensure, Report, WrapErr};
 use dpdk_wrapper::{
@@ -8,11 +10,13 @@ use dpdk_wrapper::{
     wrapper::*,
 };
 use eui48::MacAddress;
+use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::mem::zeroed;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
-use tracing::{debug, trace, warn};
+use std::time::Duration;
+use tracing::{debug, info, trace, warn};
 
 /// A message from DPDK.
 #[derive(Debug)]
@@ -414,5 +418,91 @@ pub fn dpdk_inline_client(
         req_padding_size,
     }: Client,
 ) -> Result<(), Report> {
-    todo!()
+    ensure!(conn_count == 1, "multiple connections not supported yet");
+    let dpdk = DpdkState::new(cfg)?;
+    let clk = quanta::Clock::new();
+    let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
+    let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
+    let timer = AsyncSpinTimer::new(req_interarrival);
+    let ops = futures_util::stream::iter(work_gen)
+        .zip(timer.into_stream())
+        .take(num_reqs / conn_count)
+        .map(|(x, _)| x);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let then = clk.start();
+    let c = clk.clone();
+    let durs = rt.block_on(async move {
+        tokio::pin!(ops);
+        dpdk_inline_client_inner(dpdk, c, ops, req_padding_size, addr).await
+    })?;
+
+    info!(num_reqs = ?durs.len(), "done");
+
+    let now = clk.end();
+    let elapsed = clk.delta(then, now);
+    let remaining = num_reqs - durs.len();
+    write_results(durs, remaining, elapsed, load_req_per_s, out_file);
+    Ok(())
+}
+
+async fn dpdk_inline_client_inner(
+    mut dpdk: DpdkState,
+    clk: quanta::Clock,
+    mut ops: impl futures_util::stream::Stream<Item = Work> + std::marker::Unpin,
+    req_padding_size: usize,
+    addr: SocketAddrV4,
+) -> Result<Vec<DoneResp>, Report> {
+    let mut send_buf = vec![0u8; 1500];
+    let mut done_reqs = Vec::with_capacity(1024 * 1024);
+    let src_port = 12552;
+    loop {
+        // 1. try receive
+        if let Some(p) = dpdk.try_recv()? {
+            let resp_buf = p.get_buf();
+            ensure!(resp_buf.len() > 8, "msg too short: {} < 8", resp_buf.len());
+            let sz = u64::from_be_bytes(resp_buf[0..8].try_into().unwrap()) as usize;
+            ensure!(
+                resp_buf.len() >= 8 + sz,
+                "msg too short for declared size: {} < {}",
+                resp_buf.len(),
+                8 + sz
+            );
+            let resp: Resp = bincode::deserialize(&resp_buf[8..8 + sz]).wrap_err("deserialize")?;
+            let duration = clk.delta(resp.client_time, clk.end());
+            done_reqs.push(DoneResp {
+                srv_time: resp.srv_time,
+                duration,
+            });
+        }
+
+        // 2. is it time to send the next request?
+        match futures_util::poll!(ops.next()) {
+            std::task::Poll::Ready(Some(op)) => {
+                let req = Req {
+                    wrk: op,
+                    client_time: clk.start(),
+                };
+                let sz = bincode::serialized_size(&req)?;
+                send_buf.resize((8 + sz + req_padding_size as u64) as usize, 0);
+                send_buf[0..8].copy_from_slice(&sz.to_be_bytes());
+                bincode::serialize_into(&mut send_buf[8..(8 + sz) as usize], &req)?;
+                dpdk.send(
+                    addr,
+                    src_port,
+                    &send_buf[0..(8 + sz as usize + req_padding_size)],
+                )?;
+            }
+            std::task::Poll::Ready(None) => {
+                info!("done");
+                break;
+            }
+            _ => (),
+        }
+    }
+
+    Ok(done_reqs)
 }
