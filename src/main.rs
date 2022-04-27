@@ -1,5 +1,8 @@
 use color_eyre::eyre::Report;
-use datapath_bench::{dpdk_client, dpdk_server, shenango_client, shenango_server, Client, Server};
+use datapath_bench::{
+    dpdk_client, dpdk_inline_client, dpdk_inline_server, dpdk_server, shenango_client,
+    shenango_server, Client, Server,
+};
 use std::path::PathBuf;
 use structopt::StructOpt;
 use tracing_error::ErrorLayer;
@@ -53,6 +56,13 @@ fn main() -> Result<(), Report> {
             Mode::Server(s) => dpdk_server(cfg, s),
             Mode::Client(c) => {
                 dpdk_client(cfg, out_file, c)?;
+                Ok(())
+            }
+        },
+        "dpdkinline" => match mode {
+            Mode::Server(s) => dpdk_inline_server(cfg, s),
+            Mode::Client(c) => {
+                dpdk_inline_client(cfg, out_file, c)?;
                 Ok(())
             }
         },
