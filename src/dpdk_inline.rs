@@ -1,6 +1,4 @@
-use crate::{
-    write_results, AsyncSpinTimer, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator,
-};
+use crate::{write_results, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator};
 use ahash::AHashMap as HashMap;
 use color_eyre::eyre::{bail, ensure, Report, WrapErr};
 use dpdk_wrapper::{
@@ -10,7 +8,6 @@ use dpdk_wrapper::{
     wrapper::*,
 };
 use eui48::MacAddress;
-use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::mem::zeroed;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -423,22 +420,11 @@ pub fn dpdk_inline_client(
     let clk = quanta::Clock::new();
     let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
-    let timer = AsyncSpinTimer::new(req_interarrival);
-    let ops = futures_util::stream::iter(work_gen)
-        .zip(timer.into_stream())
-        .take(num_reqs / conn_count)
-        .map(|(x, _)| x);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let ops = work_gen.take(num_reqs);
 
     let then = clk.start();
     let c = clk.clone();
-    let durs = rt.block_on(async move {
-        tokio::pin!(ops);
-        dpdk_inline_client_inner(dpdk, c, ops, req_padding_size, addr).await
-    })?;
+    let durs = dpdk_inline_client_inner(dpdk, c, ops, req_interarrival, req_padding_size, addr)?;
 
     info!(num_reqs = ?durs.len(), "done");
 
@@ -449,13 +435,15 @@ pub fn dpdk_inline_client(
     Ok(())
 }
 
-async fn dpdk_inline_client_inner(
+fn dpdk_inline_client_inner(
     mut dpdk: DpdkState,
     clk: quanta::Clock,
-    mut ops: impl futures_util::stream::Stream<Item = Work> + std::marker::Unpin,
+    mut ops: impl Iterator<Item = Work>,
+    req_interarrival: Duration,
     req_padding_size: usize,
     addr: SocketAddrV4,
 ) -> Result<Vec<DoneResp>, Report> {
+    let next_request_time = clk.now() + req_interarrival;
     let mut send_buf = vec![0u8; 1500];
     let mut done_reqs = Vec::with_capacity(1024 * 1024);
     let src_port = 12552;
@@ -480,29 +468,29 @@ async fn dpdk_inline_client_inner(
         }
 
         // 2. is it time to send the next request?
-        match futures_util::poll!(ops.next()) {
-            std::task::Poll::Ready(Some(op)) => {
-                let req = Req {
-                    wrk: op,
-                    client_time: clk.start(),
-                };
-                let sz = bincode::serialized_size(&req)?;
-                send_buf.resize((8 + sz + req_padding_size as u64) as usize, 0);
-                send_buf[0..8].copy_from_slice(&sz.to_be_bytes());
-                bincode::serialize_into(&mut send_buf[8..(8 + sz) as usize], &req)?;
-                dpdk.send(
-                    addr,
-                    src_port,
-                    &send_buf[0..(8 + sz as usize + req_padding_size)],
-                )?;
+        if clk.now() > next_request_time {
+            match ops.next() {
+                Some(op) => {
+                    trace!("sending request");
+                    let req = Req {
+                        wrk: op,
+                        client_time: clk.start(),
+                    };
+                    let sz = bincode::serialized_size(&req)?;
+                    send_buf.resize((8 + sz + req_padding_size as u64) as usize, 0);
+                    send_buf[0..8].copy_from_slice(&sz.to_be_bytes());
+                    bincode::serialize_into(&mut send_buf[8..(8 + sz) as usize], &req)?;
+                    dpdk.send(
+                        addr,
+                        src_port,
+                        &send_buf[0..(8 + sz as usize + req_padding_size)],
+                    )?;
+                }
+                None => {
+                    info!("done");
+                    return Ok(done_reqs);
+                }
             }
-            std::task::Poll::Ready(None) => {
-                info!("done");
-                break;
-            }
-            _ => (),
         }
     }
-
-    Ok(done_reqs)
 }
