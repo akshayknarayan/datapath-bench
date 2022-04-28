@@ -8,7 +8,6 @@ use dpdk_wrapper::{
     wrapper::*,
 };
 use eui48::MacAddress;
-use std::collections::VecDeque;
 use std::mem::zeroed;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
@@ -40,6 +39,14 @@ impl Drop for Msg {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SendMsg {
+    to_addr: SocketAddrV4,
+    src_port: u16,
+    buf_ptr: *const u8,
+    buf_len: usize,
+}
+
 /// Spin-polling DPDK datapath event loop.
 ///
 /// There should only be one of these. It is responsible for actually sending and receiving
@@ -53,7 +60,6 @@ pub struct DpdkState {
     mbuf_pool: *mut rte_mempool,
     arp_table: HashMap<Ipv4Addr, MacAddress>,
 
-    pending_recvs: VecDeque<Msg>,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     listen_ports: Option<Vec<u16>>,
 
@@ -111,7 +117,6 @@ impl DpdkState {
             mbuf_pool,
             arp_table,
             rx_bufs: unsafe { zeroed() },
-            pending_recvs: VecDeque::with_capacity(RECEIVE_BURST_SIZE as _),
             tx_bufs: unsafe { zeroed() },
             ip_id: 0,
             listen_ports: None,
@@ -126,13 +131,14 @@ impl DpdkState {
         }
     }
 
-    fn try_recv(&mut self) -> Result<Option<Msg>, Report> {
-        // 1. check if already received packets are available to return
-        if let Some(m) = self.pending_recvs.pop_front() {
-            return Ok(Some(m));
-        }
-
-        // 2. try to receive.
+    fn try_recv<'buf>(
+        &mut self,
+        rcvd_msgs: &'buf mut [Option<Msg>],
+    ) -> Result<&'buf mut [Option<Msg>], Report> {
+        ensure!(
+            rcvd_msgs.len() >= RECEIVE_BURST_SIZE as usize,
+            "Received messages slice not large enough"
+        );
         let num_received = unsafe {
             rte_eth_rx_burst(
                 self.port,
@@ -141,6 +147,7 @@ impl DpdkState {
                 RECEIVE_BURST_SIZE as u16,
             )
         } as usize;
+        let mut num_valid = 0;
         for i in 0..num_received {
             // first: parse if valid packet, and what the payload size is
             let (is_valid, src_ether, src_ip, src_port, dst_port, payload_length) =
@@ -173,15 +180,13 @@ impl DpdkState {
                 mbuf: self.rx_bufs[i],
                 payload_length,
             };
-            self.pending_recvs.push_back(msg);
+
+            rcvd_msgs[num_valid] = Some(msg);
+            num_valid += 1;
         }
 
-        // 3. if we received anything, return it.
-        if !self.pending_recvs.is_empty() {
-            trace!(num_valid=?self.pending_recvs.len(), "Received valid packets");
-        }
-
-        Ok(self.pending_recvs.pop_front())
+        trace!(?num_valid, "Received valid packets");
+        Ok(&mut rcvd_msgs[..num_valid])
     }
 
     fn send<'a>(
@@ -254,12 +259,15 @@ impl DpdkState {
         Ok(())
     }
 
-    fn send_burst<'a>(
-        &mut self,
-        msgs: impl Iterator<Item = (SocketAddrV4, u16, &'a [u8])>,
-    ) -> Result<(), Report> {
+    fn send_burst(&mut self, msgs: impl Iterator<Item = SendMsg>) -> Result<(), Report> {
         let mut i = 0;
-        for (to_addr, src_port, buf) in msgs {
+        for SendMsg {
+            to_addr,
+            src_port,
+            buf_ptr,
+            buf_len,
+        } in msgs
+        {
             let to_ip = to_addr.ip();
             let to_port = to_addr.port();
             unsafe {
@@ -291,7 +299,7 @@ impl DpdkState {
                 let hdr_size = match fill_in_header(
                     self.tx_bufs[i],
                     &HeaderInfo { src_info, dst_info },
-                    buf.len(),
+                    buf_len,
                     self.ip_id,
                 ) {
                     Ok(s) => {
@@ -307,15 +315,11 @@ impl DpdkState {
                 };
 
                 // write payload
-                let payload_slice = mbuf_slice!(self.tx_bufs[i], hdr_size, buf.len());
-                rte_memcpy_wrapper(
-                    payload_slice.as_mut_ptr() as _,
-                    buf.as_ptr() as _,
-                    buf.len(),
-                );
+                let payload_slice = mbuf_slice!(self.tx_bufs[i], hdr_size, buf_len);
+                rte_memcpy_wrapper(payload_slice.as_mut_ptr() as _, buf_ptr as _, buf_len);
 
-                (*self.tx_bufs[i]).pkt_len = (hdr_size + buf.len()) as u32;
-                (*self.tx_bufs[i]).data_len = (hdr_size + buf.len()) as u16;
+                (*self.tx_bufs[i]).pkt_len = (hdr_size + buf_len) as u32;
+                (*self.tx_bufs[i]).data_len = (hdr_size + buf_len) as u16;
 
                 i += 1;
                 if i >= (RECEIVE_BURST_SIZE as _) {
@@ -344,7 +348,8 @@ pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), R
         mem.shuffle(&mut rng);
         mem
     };
-    let mut tx_buf = [0u8; std::mem::size_of::<Resp>() + 16];
+    let mut tx_bufs = [[0u8; std::mem::size_of::<Resp>() + 16]; RECEIVE_BURST_SIZE as usize];
+    let mut send_burst = [None; RECEIVE_BURST_SIZE as usize];
     let clk = quanta::Clock::new();
 
     fn do_req(clk: &quanta::Clock, buf: &[u8], access_buf: &[usize]) -> Result<Resp, Report> {
@@ -368,37 +373,46 @@ pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), R
         })
     }
 
+    let mut recv_msg_buf: [Option<Msg>; RECEIVE_BURST_SIZE as usize] = Default::default();
     dpdk.listen(port);
     loop {
-        // 1. try to receive requests.
-        let msg = match dpdk.try_recv()? {
-            Some(m) => m,
-            None => continue,
-        };
+        // 1. receive a batch of requests
+        let msgs = dpdk.try_recv(&mut recv_msg_buf[..])?;
+        let mut idx = 0;
+        for msg in msgs.iter_mut().map_while(|x| x.take()) {
+            let from = msg.addr;
+            trace!(?from, "got msg");
 
-        let from = msg.addr;
-        trace!(?from, "got msg");
+            // 2. if there are requests, deserialize and process them.
+            let resp = match do_req(&clk, msg.get_buf(), &access_buf[..]) {
+                Err(err) => {
+                    warn!(?err, "request errored");
+                    continue;
+                }
+                Ok(dur) => dur,
+            };
 
-        // 2. if there are requests, deserialize and process them.
-        let resp = match do_req(&clk, msg.get_buf(), &access_buf[..]) {
-            Err(err) => {
-                warn!(?err, "request errored");
-                continue;
-            }
-            Ok(dur) => dur,
-        };
+            let sz = bincode::serialized_size(&resp)?;
 
-        tx_buf.fill(0);
-        let sz = bincode::serialized_size(&resp)?;
-        ensure!(
-            tx_buf.len() >= sz as usize + 8,
-            "Stack-allocated message array not big enough"
-        );
-        tx_buf[0..8].copy_from_slice(&sz.to_be_bytes());
-        bincode::serialize_into(&mut tx_buf[8..], &resp)?;
+            ensure!(
+                tx_bufs[idx].len() >= sz as usize + 8,
+                "Stack-allocated message array not big enough"
+            );
+            tx_bufs[idx][0..8].copy_from_slice(&sz.to_be_bytes());
+            bincode::serialize_into(&mut tx_bufs[idx][8..], &resp)?;
 
-        dpdk.send(from, port, &tx_buf[0..(8 + sz as usize)])?;
-        trace!(?from, "sent echo");
+            send_burst[idx] = Some(SendMsg {
+                to_addr: from,
+                src_port: port,
+                buf_ptr: tx_bufs[idx].as_ptr(),
+                buf_len: 8 + sz as usize,
+            });
+
+            idx += 1;
+        }
+
+        dpdk.send_burst(send_burst.iter_mut().map_while(|x| x.take()))?;
+        trace!(burst_size=?idx, "sent echo burst");
     }
 }
 
@@ -445,11 +459,13 @@ fn dpdk_inline_client_inner(
 ) -> Result<Vec<DoneResp>, Report> {
     let next_request_time = clk.now() + req_interarrival;
     let mut send_buf = vec![0u8; 1500];
+    let mut recv_msg_buf: [Option<Msg>; RECEIVE_BURST_SIZE as usize] = Default::default();
     let mut done_reqs = Vec::with_capacity(1024 * 1024);
     let src_port = 12552;
     loop {
-        // 1. try receive
-        if let Some(p) = dpdk.try_recv()? {
+        // 1. try receive burst
+        let msgs = dpdk.try_recv(&mut recv_msg_buf[..])?;
+        for p in msgs.iter_mut().map_while(|x| x.take()) {
             let resp_buf = p.get_buf();
             ensure!(resp_buf.len() > 8, "msg too short: {} < 8", resp_buf.len());
             let sz = u64::from_be_bytes(resp_buf[0..8].try_into().unwrap()) as usize;
