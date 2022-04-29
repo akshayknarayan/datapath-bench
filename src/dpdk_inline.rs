@@ -12,7 +12,7 @@ use std::mem::zeroed;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// A message from DPDK.
 #[derive(Debug)]
@@ -67,6 +67,9 @@ pub struct DpdkState {
     ip_id: u16,
 }
 
+// SAFETY: rte_mempools should be ok to pass between threads.
+unsafe impl Send for DpdkState {}
+
 impl DpdkState {
     /// Do global initialization.
     ///
@@ -91,11 +94,9 @@ impl DpdkState {
     ///   ip = "4.3.2.1"
     ///   mac = "05:04:03:02:01:00"
     /// ```
-    fn new(config_path: std::path::PathBuf) -> Result<Self, Report> {
+    fn new(config_path: std::path::PathBuf, num_dpdk_threads: usize) -> Result<Vec<Self>, Report> {
         let (dpdk_config, ip_addr, arp_table) = parse_cfg(config_path.as_path())?;
-        let (mbuf_pools, nb_ports) = dpdk_init(dpdk_config, 1)?;
-
-        let mbuf_pool = mbuf_pools[0];
+        let (mbuf_pools, nb_ports) = dpdk_init(dpdk_config, num_dpdk_threads)?;
         let port = nb_ports - 1;
 
         // what is my ethernet address (rte_ether_addr struct)
@@ -108,19 +109,22 @@ impl DpdkState {
         let octets = ip_addr.octets();
         let ip_addr_raw: u32 = unsafe { make_ip(octets[0], octets[1], octets[2], octets[3]) };
 
-        Ok(Self {
-            eth_addr,
-            eth_addr_raw,
-            ip_addr,
-            ip_addr_raw,
-            port,
-            mbuf_pool,
-            arp_table,
-            rx_bufs: unsafe { zeroed() },
-            tx_bufs: unsafe { zeroed() },
-            ip_id: 0,
-            listen_ports: None,
-        })
+        Ok(mbuf_pools
+            .into_iter()
+            .map(|mbuf_pool| Self {
+                eth_addr,
+                eth_addr_raw,
+                ip_addr,
+                ip_addr_raw,
+                port,
+                mbuf_pool,
+                arp_table: arp_table.clone(),
+                rx_bufs: unsafe { zeroed() },
+                tx_bufs: unsafe { zeroed() },
+                ip_id: 0,
+                listen_ports: None,
+            })
+            .collect())
     }
 
     fn listen(&mut self, port: u16) {
@@ -340,7 +344,31 @@ impl DpdkState {
 }
 
 pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
-    let mut dpdk = DpdkState::new(cfg)?;
+    let mut dpdks = DpdkState::new(cfg, 2)?;
+
+    fn go(dpdk: DpdkState, port: u16, core: usize) {
+        // affinitize
+        if let Err(err) = affinitize_thread(core) {
+            error!(?err, "affinitize_thread errored");
+            return;
+        }
+
+        // start processing
+        if let Err(err) = dpdk_server_thread(dpdk, port) {
+            error!(?err, "dpdk server thread errored");
+        }
+    }
+
+    let dpdk_1 = dpdks.pop().unwrap();
+    std::thread::spawn(move || {
+        go(dpdk_1, port, 3);
+    });
+
+    go(dpdks.pop().unwrap(), port, 1);
+    unreachable!()
+}
+
+fn dpdk_server_thread(mut dpdk: DpdkState, port: u16) -> Result<(), Report> {
     let access_buf = {
         let mut rng = rand::thread_rng();
         let mut mem: Vec<usize> = (0..(8 * 1024)).collect();
@@ -430,7 +458,7 @@ pub fn dpdk_inline_client(
     }: Client,
 ) -> Result<(), Report> {
     ensure!(conn_count == 1, "multiple connections not supported yet");
-    let dpdk = DpdkState::new(cfg)?;
+    let dpdk = DpdkState::new(cfg, 1)?.pop().unwrap();
     let clk = quanta::Clock::new();
     let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
