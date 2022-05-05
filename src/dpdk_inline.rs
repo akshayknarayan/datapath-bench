@@ -60,6 +60,7 @@ pub struct DpdkState {
     mbuf_pool: *mut rte_mempool,
     arp_table: HashMap<Ipv4Addr, MacAddress>,
 
+    rx_queue_id: usize,
     rx_bufs: [*mut rte_mbuf; RECEIVE_BURST_SIZE as usize],
     listen_ports: Option<Vec<u16>>,
 
@@ -111,7 +112,8 @@ impl DpdkState {
 
         Ok(mbuf_pools
             .into_iter()
-            .map(|mbuf_pool| Self {
+            .enumerate()
+            .map(|(qid, mbuf_pool)| Self {
                 eth_addr,
                 eth_addr_raw,
                 ip_addr,
@@ -119,6 +121,7 @@ impl DpdkState {
                 port,
                 mbuf_pool,
                 arp_table: arp_table.clone(),
+                rx_queue_id: qid,
                 rx_bufs: unsafe { zeroed() },
                 tx_bufs: unsafe { zeroed() },
                 ip_id: 0,
@@ -146,7 +149,7 @@ impl DpdkState {
         let num_received = unsafe {
             rte_eth_rx_burst(
                 self.port,
-                0,
+                self.rx_queue_id as _,
                 self.rx_bufs.as_mut_ptr(),
                 RECEIVE_BURST_SIZE as u16,
             )
