@@ -189,7 +189,10 @@ impl DpdkState {
             num_valid += 1;
         }
 
-        trace!(?num_valid, "Received valid packets");
+        if num_valid > 0 {
+            trace!(?num_valid, "Received valid packets");
+        }
+
         Ok(&mut rcvd_msgs[..num_valid])
     }
 
@@ -222,8 +225,6 @@ impl DpdkState {
                 ipv4_addr: *to_ip,
                 ether_addr: *dst_ether_addr,
             };
-
-            trace!(?src_info, ?dst_info, "writing header");
 
             // fill header
             let hdr_size = match fill_in_header(
@@ -297,8 +298,6 @@ impl DpdkState {
                     ether_addr: *dst_ether_addr,
                 };
 
-                trace!(?src_info, ?dst_info, "writing header");
-
                 // fill header
                 let hdr_size = match fill_in_header(
                     self.tx_bufs[i],
@@ -368,6 +367,7 @@ pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), R
     unreachable!()
 }
 
+#[tracing::instrument(skip(dpdk), level = "debug")]
 fn dpdk_server_thread(mut dpdk: DpdkState, port: u16) -> Result<(), Report> {
     let access_buf = {
         let mut rng = rand::thread_rng();
@@ -409,7 +409,6 @@ fn dpdk_server_thread(mut dpdk: DpdkState, port: u16) -> Result<(), Report> {
         let mut idx = 0;
         for msg in msgs.iter_mut().map_while(|x| x.take()) {
             let from = msg.addr;
-            trace!(?from, "got msg");
 
             // 2. if there are requests, deserialize and process them.
             let resp = match do_req(&clk, msg.get_buf(), &access_buf[..]) {
@@ -439,8 +438,10 @@ fn dpdk_server_thread(mut dpdk: DpdkState, port: u16) -> Result<(), Report> {
             idx += 1;
         }
 
-        dpdk.send_burst(send_burst.iter_mut().map_while(|x| x.take()))?;
-        trace!(burst_size=?idx, "sent echo burst");
+        if idx > 0 {
+            dpdk.send_burst(send_burst.iter_mut().map_while(|x| x.take()))?;
+            trace!(burst_size=?idx, "sent echo burst");
+        }
     }
 }
 
