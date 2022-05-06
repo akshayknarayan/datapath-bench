@@ -489,7 +489,7 @@ fn dpdk_inline_client_inner(
     req_padding_size: usize,
     addr: SocketAddrV4,
 ) -> Result<Vec<DoneResp>, Report> {
-    let next_request_time = clk.now() + req_interarrival;
+    let mut next_request_time = clk.now() + req_interarrival;
     let mut send_buf = vec![0u8; 1500];
     let mut recv_msg_buf: [Option<Msg>; RECEIVE_BURST_SIZE as usize] = Default::default();
     let mut done_reqs = Vec::with_capacity(1024 * 1024);
@@ -517,6 +517,7 @@ fn dpdk_inline_client_inner(
 
         // 2. is it time to send the next request?
         if clk.now() > next_request_time {
+            next_request_time += req_interarrival;
             match ops.next() {
                 Some(op) => {
                     trace!("sending request");
