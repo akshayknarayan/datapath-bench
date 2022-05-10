@@ -348,6 +348,7 @@ impl DpdkState {
 pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
     let mut dpdks = DpdkState::new(cfg, 2)?;
 
+    #[tracing::instrument(skip(dpdk), level = "debug")]
     fn go(dpdk: DpdkState, port: u16, core: usize) {
         // affinitize
         if let Err(err) = affinitize_thread(core) {
@@ -370,7 +371,6 @@ pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), R
     unreachable!()
 }
 
-#[tracing::instrument(skip(dpdk), level = "debug")]
 fn dpdk_server_thread(mut dpdk: DpdkState, port: u16) -> Result<(), Report> {
     let access_buf = {
         let mut rng = rand::thread_rng();
@@ -406,6 +406,8 @@ fn dpdk_server_thread(mut dpdk: DpdkState, port: u16) -> Result<(), Report> {
 
     let mut recv_msg_buf: [Option<Msg>; RECEIVE_BURST_SIZE as usize] = Default::default();
     dpdk.listen(port);
+    let mut num_reqs = 0;
+    let mut epoch_start = clk.start();
     loop {
         // 1. receive a batch of requests
         let msgs = dpdk.try_recv(&mut recv_msg_buf[..])?;
@@ -444,6 +446,12 @@ fn dpdk_server_thread(mut dpdk: DpdkState, port: u16) -> Result<(), Report> {
         if idx > 0 {
             dpdk.send_burst(send_burst.iter_mut().map_while(|x| x.take()))?;
             trace!(burst_size=?idx, "sent echo burst");
+            num_reqs += idx;
+        }
+
+        if clk.delta(epoch_start, clk.end()) > std::time::Duration::from_secs(5) {
+            debug!(?num_reqs, "epoch requests");
+            epoch_start = clk.start();
         }
     }
 }
@@ -493,7 +501,8 @@ fn dpdk_inline_client_inner(
     let mut send_buf = vec![0u8; 1500];
     let mut recv_msg_buf: [Option<Msg>; RECEIVE_BURST_SIZE as usize] = Default::default();
     let mut done_reqs = Vec::with_capacity(1024 * 1024);
-    let src_port = 12552;
+    let src_ports = [12552, 12553, 12554, 12555];
+    let mut src_port_idx = 0;
     loop {
         // 1. try receive burst
         let msgs = dpdk.try_recv(&mut recv_msg_buf[..])?;
@@ -531,9 +540,10 @@ fn dpdk_inline_client_inner(
                     bincode::serialize_into(&mut send_buf[8..(8 + sz) as usize], &req)?;
                     dpdk.send(
                         addr,
-                        src_port,
+                        src_ports[src_port_idx],
                         &send_buf[0..(8 + sz as usize + req_padding_size)],
                     )?;
+                    src_port_idx = (src_port_idx + 1) % src_ports.len();
                 }
                 None => {
                     info!("done");
