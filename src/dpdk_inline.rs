@@ -348,7 +348,7 @@ impl DpdkState {
 pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
     let mut dpdks = DpdkState::new(cfg, 2)?;
 
-    #[tracing::instrument(skip(dpdk), level = "debug")]
+    #[tracing::instrument(skip(dpdk), level = "info")]
     fn go(dpdk: DpdkState, port: u16, core: usize) {
         // affinitize
         if let Err(err) = affinitize_thread(core) {
@@ -469,18 +469,79 @@ pub fn dpdk_inline_client(
         req_padding_size,
     }: Client,
 ) -> Result<(), Report> {
-    ensure!(conn_count == 1, "multiple connections not supported yet");
-    let dpdk = DpdkState::new(cfg, 1)?.pop().unwrap();
     let clk = quanta::Clock::new();
     let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
-    let ops = work_gen.take(num_reqs);
+    let mut dpdks = DpdkState::new(cfg, conn_count)?.into_iter();
+    let lcore_map = get_lcore_map();
+
+    #[tracing::instrument(
+        skip(dpdk, clk, ops, req_interarrival, req_padding_size, addr),
+        level = "info"
+    )]
+    fn go(
+        dpdk: DpdkState,
+        core: usize,
+        clk: quanta::Clock,
+        ops: impl Iterator<Item = Work>,
+        req_interarrival: Duration,
+        req_padding_size: usize,
+        addr: SocketAddrV4,
+    ) -> Result<Vec<DoneResp>, Report> {
+        // affinitize
+        if let Err(err) = affinitize_thread(core) {
+            error!(?err, "affinitize_thread errored");
+            return Err(err);
+        }
+
+        info!(
+            ?core,
+            ?req_interarrival,
+            ?req_padding_size,
+            ?addr,
+            "starting"
+        );
+        let durs =
+            dpdk_inline_client_inner(dpdk, clk, ops, req_interarrival, req_padding_size, addr)?;
+        info!(num_reqs = ?durs.len(), "done");
+        Ok(durs)
+    }
 
     let then = clk.start();
-    let c = clk.clone();
-    let durs = dpdk_inline_client_inner(dpdk, c, ops, req_interarrival, req_padding_size, addr)?;
+    let mut jhs = Vec::with_capacity(dpdks.len());
 
-    info!(num_reqs = ?durs.len(), "done");
+    let local_thread_dpdk = dpdks.next().expect("Need at least one dpdk initialized");
+    for (i, dpdk) in dpdks.enumerate() {
+        let c = clk.clone();
+        let ops = work_gen.clone().take(num_reqs);
+        let lcore_map = lcore_map.clone();
+        let jh = std::thread::spawn(move || {
+            go(
+                dpdk,
+                lcore_map[i + 1] as _,
+                c,
+                ops,
+                req_interarrival,
+                req_padding_size,
+                addr,
+            )
+        });
+        jhs.push(jh);
+    }
+
+    let mut durs = go(
+        local_thread_dpdk,
+        lcore_map[0] as _,
+        clk.clone(),
+        work_gen.take(num_reqs),
+        req_interarrival,
+        req_padding_size,
+        addr,
+    )?;
+
+    for jh in jhs {
+        durs.extend(jh.join().unwrap()?);
+    }
 
     let now = clk.end();
     let elapsed = clk.delta(then, now);
