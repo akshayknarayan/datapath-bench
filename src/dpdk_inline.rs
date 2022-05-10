@@ -474,9 +474,11 @@ pub fn dpdk_inline_client(
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
     let mut dpdks = DpdkState::new(cfg, conn_count)?.into_iter();
     let lcore_map = get_lcore_map();
+    debug!(?lcore_map, "got lcore map");
 
     #[tracing::instrument(
         skip(dpdk, clk, ops, req_interarrival, req_padding_size, addr),
+        err,
         level = "info"
     )]
     fn go(
@@ -487,6 +489,7 @@ pub fn dpdk_inline_client(
         req_interarrival: Duration,
         req_padding_size: usize,
         addr: SocketAddrV4,
+        src_ports: &[u16],
     ) -> Result<Vec<DoneResp>, Report> {
         // affinitize
         if let Err(err) = affinitize_thread(core) {
@@ -501,8 +504,15 @@ pub fn dpdk_inline_client(
             ?addr,
             "starting"
         );
-        let durs =
-            dpdk_inline_client_inner(dpdk, clk, ops, req_interarrival, req_padding_size, addr)?;
+        let durs = dpdk_inline_client_inner(
+            dpdk,
+            clk,
+            ops,
+            req_interarrival,
+            req_padding_size,
+            addr,
+            src_ports,
+        )?;
         info!(num_reqs = ?durs.len(), "done");
         Ok(durs)
     }
@@ -511,9 +521,10 @@ pub fn dpdk_inline_client(
     let mut jhs = Vec::with_capacity(dpdks.len());
 
     let local_thread_dpdk = dpdks.next().expect("Need at least one dpdk initialized");
+    let mut start_src_port = 12552;
     for (i, dpdk) in dpdks.enumerate() {
         let c = clk.clone();
-        let ops = work_gen.clone().take(num_reqs);
+        let ops = work_gen.clone().take(num_reqs / conn_count);
         let lcore_map = lcore_map.clone();
         let jh = std::thread::spawn(move || {
             go(
@@ -524,8 +535,15 @@ pub fn dpdk_inline_client(
                 req_interarrival,
                 req_padding_size,
                 addr,
+                &[
+                    start_src_port,
+                    start_src_port + 1,
+                    start_src_port + 2,
+                    start_src_port + 3,
+                ],
             )
         });
+        start_src_port += 4;
         jhs.push(jh);
     }
 
@@ -533,14 +551,23 @@ pub fn dpdk_inline_client(
         local_thread_dpdk,
         lcore_map[0] as _,
         clk.clone(),
-        work_gen.take(num_reqs),
+        work_gen.take(num_reqs / conn_count),
         req_interarrival,
         req_padding_size,
         addr,
+        &[
+            start_src_port,
+            start_src_port + 1,
+            start_src_port + 2,
+            start_src_port + 3,
+        ],
     )?;
 
+    debug!(first_client_reqs = ?durs.len(), "local client thread done");
     for jh in jhs {
-        durs.extend(jh.join().unwrap()?);
+        let client_reqs = jh.join().unwrap()?;
+        debug!(nth_client_reqs = ?client_reqs.len(), "spawned client thread joined");
+        durs.extend(client_reqs);
     }
 
     let now = clk.end();
@@ -557,12 +584,12 @@ fn dpdk_inline_client_inner(
     req_interarrival: Duration,
     req_padding_size: usize,
     addr: SocketAddrV4,
+    src_ports: &[u16],
 ) -> Result<Vec<DoneResp>, Report> {
     let mut next_request_time = clk.now() + req_interarrival;
     let mut send_buf = vec![0u8; 1500];
     let mut recv_msg_buf: [Option<Msg>; RECEIVE_BURST_SIZE as usize] = Default::default();
     let mut done_reqs = Vec::with_capacity(1024 * 1024);
-    let src_ports = [12552, 12553, 12554, 12555];
     let mut src_port_idx = 0;
     loop {
         // 1. try receive burst
