@@ -75,6 +75,14 @@ impl FromStr for Work {
     }
 }
 
+fn black_box<T>(dummy: T) -> T {
+    unsafe {
+        let ret = std::ptr::read_volatile(&dummy);
+        std::mem::forget(dummy);
+        ret
+    }
+}
+
 impl Work {
     fn work(self, access_buf: &[usize]) {
         match self {
@@ -84,14 +92,12 @@ impl Work {
                 // https://github.com/shenango/shenango/blob/master/apps/synthetic/src/fakework.rs#L54
                 let k = 2350845.545;
                 for i in 0..amt {
-                    criterion::black_box(f64::sqrt(k * i as f64));
+                    black_box(f64::sqrt(k * i as f64));
                 }
             }
             Work::Memory(amt) => {
                 for i in 0..(amt as usize) {
-                    criterion::black_box(
-                        access_buf[access_buf[i % access_buf.len()] % access_buf.len()],
-                    );
+                    black_box(access_buf[access_buf[i % access_buf.len()] % access_buf.len()]);
                 }
             }
         }
