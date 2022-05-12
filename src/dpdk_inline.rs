@@ -82,7 +82,7 @@ impl DpdkState {
     /// # Example Config
     /// ```toml
     /// [dpdk]
-    /// eal_init = ["-n", "4", "--allow", "0000:99:00.0", "--vdev", "net_pcap0,tx_pcap=out.pcap"]
+    /// eal_init = ["-n", "4", "-l", "0-4", "--allow", "0000:08:00.0", "--proc-type=auto"]
     ///
     /// [net]
     /// ip = "1.2.3.4"
@@ -260,7 +260,14 @@ impl DpdkState {
             (*self.tx_bufs[0]).data_len = (hdr_size + buf.len()) as u16;
         }
 
-        if let Err(err) = unsafe { tx_burst(self.port, 0, self.tx_bufs.as_mut_ptr(), 1 as u16) } {
+        if let Err(err) = unsafe {
+            tx_burst(
+                self.port,
+                self.rx_queue_id as _,
+                self.tx_bufs.as_mut_ptr(),
+                1 as u16,
+            )
+        } {
             warn!(?err, "tx_burst error");
         }
 
@@ -335,8 +342,14 @@ impl DpdkState {
         }
 
         if i > 0 {
-            if let Err(err) = unsafe { tx_burst(self.port, 0, self.tx_bufs.as_mut_ptr(), i as u16) }
-            {
+            if let Err(err) = unsafe {
+                tx_burst(
+                    self.port,
+                    self.rx_queue_id as _,
+                    self.tx_bufs.as_mut_ptr(),
+                    i as u16,
+                )
+            } {
                 warn!(?err, "tx_burst error");
             }
         }
@@ -347,6 +360,8 @@ impl DpdkState {
 
 pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
     let mut dpdks = DpdkState::new(cfg, 2)?;
+    let lcore_map = get_lcore_map();
+    debug!(?lcore_map, "got lcore map");
 
     #[tracing::instrument(skip(dpdk), level = "info")]
     fn go(dpdk: DpdkState, port: u16, core: usize) {
@@ -363,11 +378,12 @@ pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), R
     }
 
     let dpdk_1 = dpdks.pop().unwrap();
+    let lc = lcore_map.clone();
     std::thread::spawn(move || {
-        go(dpdk_1, port, 3);
+        go(dpdk_1, port, lc[1] as _);
     });
 
-    go(dpdks.pop().unwrap(), port, 1);
+    go(dpdks.pop().unwrap(), port, lcore_map[0] as _);
     unreachable!()
 }
 
