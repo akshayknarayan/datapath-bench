@@ -31,7 +31,7 @@ def setup_machine(conn, outdir):
 
 dpdk_ld_var = "LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:dpdk-direct/dpdk-wrapper/dpdk/install/lib/x86_64-linux-gnu"
 
-def start_server(conn, outf, variant='dpdk'):
+def start_server(conn, outf, num_threads, variant='dpdk'):
     conn.run("sudo pkill -9 datapath-bench")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -43,7 +43,7 @@ def start_server(conn, outf, variant='dpdk'):
         raise Exception("unknown datapath")
 
     time.sleep(2)
-    ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} ./target/release/datapath-bench --cfg host.config --datapath {variant} server -p 4242",
+    ok = conn.run(f"RUST_LOG=debug {dpdk_ld_var} ./target/release/datapath-bench --cfg host.config --datapath {variant} server -p 4242 -t {num_threads}",
         wd="~/burrito",
         sudo=True,
         background=True,
@@ -140,7 +140,7 @@ def do_exp(iter_num,
 
     # first one is the server, start the server
     agenda.subtask("starting server")
-    start_server(machines[0], server_prefix, variant=datapath)
+    start_server(machines[0], server_prefix, num_clients, variant=datapath)
     time.sleep(7)
 
     # others are clients
