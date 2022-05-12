@@ -44,8 +44,17 @@ pub struct Client {
 
 #[derive(Debug, Clone, StructOpt)]
 pub struct Server {
+    /// The port to listen on.
     #[structopt(short, long)]
     pub port: u16,
+
+    /// Maximum number of server threads to spawn.
+    ///
+    /// For connetion-oriented datapaths, this is the maximum number of concurrent threads to
+    /// spawn, while fixed-concurrency datapaths will just spawn this number of threads at the
+    /// beginning.
+    #[structopt(short, long)]
+    pub threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

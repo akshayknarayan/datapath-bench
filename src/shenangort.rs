@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-pub fn shenango_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
+pub fn shenango_server(cfg: PathBuf, Server { port, .. }: Server) -> Result<(), Report> {
     info!(?cfg, ?port, "starting server");
     shenango::runtime_init(cfg.to_str().unwrap().to_owned(), move || {
         if let Err(err) = server(port) {

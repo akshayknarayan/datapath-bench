@@ -358,10 +358,17 @@ impl DpdkState {
     }
 }
 
-pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
-    let mut dpdks = DpdkState::new(cfg, 2)?;
+pub fn dpdk_inline_server(cfg: PathBuf, Server { port, threads }: Server) -> Result<(), Report> {
+    let threads = threads.unwrap_or(1);
+    let mut dpdks = DpdkState::new(cfg, threads)?.into_iter();
     let lcore_map = get_lcore_map();
     debug!(?lcore_map, "got lcore map");
+    ensure!(
+        lcore_map.len() >= threads,
+        "Not enough lcores {:?} for requested number of threads {:?}",
+        lcore_map.len(),
+        threads
+    );
 
     #[tracing::instrument(skip(dpdk), level = "info")]
     fn go(dpdk: DpdkState, port: u16, core: usize) {
@@ -377,13 +384,15 @@ pub fn dpdk_inline_server(cfg: PathBuf, Server { port }: Server) -> Result<(), R
         }
     }
 
-    let dpdk_1 = dpdks.pop().unwrap();
-    let lc = lcore_map.clone();
-    std::thread::spawn(move || {
-        go(dpdk_1, port, lc[1] as _);
-    });
+    let local_thread_dpdk = dpdks.next().unwrap();
+    for (i, dpdk) in dpdks.enumerate() {
+        let lc = lcore_map.clone();
+        std::thread::spawn(move || {
+            go(dpdk, port, lc[i + 1] as _);
+        });
+    }
 
-    go(dpdks.pop().unwrap(), port, lcore_map[0] as _);
+    go(local_thread_dpdk, port, lcore_map[0] as _);
     unreachable!()
 }
 

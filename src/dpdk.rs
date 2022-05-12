@@ -30,7 +30,7 @@ async fn dpdk_raw_start_iokernel(cfg: PathBuf) -> Result<dpdk_wrapper::DpdkIoKer
     Ok(handle)
 }
 
-pub fn dpdk_server(cfg: PathBuf, Server { port }: Server) -> Result<(), Report> {
+pub fn dpdk_server(cfg: PathBuf, Server { port, .. }: Server) -> Result<(), Report> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
