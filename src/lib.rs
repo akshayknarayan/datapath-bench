@@ -1,6 +1,6 @@
-use color_eyre::eyre::{bail, Report};
+use color_eyre::eyre::{bail, eyre, Report, WrapErr};
 use quanta::Instant;
-use rand::Rng;
+use rand::{rngs::ThreadRng, Rng};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
@@ -33,10 +33,7 @@ pub struct Client {
     pub load_req_per_s: usize,
 
     #[structopt(long, default_value = "imm")]
-    pub req_work_type: Work,
-
-    #[structopt(long, default_value = "0")]
-    pub req_work_disparity: usize,
+    pub work_gen: WorkGenerator,
 
     #[structopt(long, default_value = "0")]
     pub req_padding_size: usize,
@@ -55,33 +52,6 @@ pub struct Server {
     /// beginning.
     #[structopt(short, long)]
     pub threads: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum Work {
-    Immediate,
-    BusyWork(u64),
-    Memory(u64),
-}
-
-impl FromStr for Work {
-    type Err = Report;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let sp: Vec<_> = s.split(':').collect();
-        match &sp[..] {
-            [_, mean] if *mean == "0" => Ok(Work::Immediate),
-            [variant] if *variant == "immediate" || *variant == "imm" => Ok(Work::Immediate),
-            [variant, mean] if *variant == "sqrts" || *variant == "cpu" => {
-                Ok(Work::BusyWork(mean.parse()?))
-            }
-            [variant, mean] if *variant == "memory" || *variant == "mem" => {
-                Ok(Work::Memory(mean.parse()?))
-            }
-            x => {
-                bail!("Could not parse work: {:?}", x)
-            }
-        }
-    }
 }
 
 fn black_box<T>(dummy: T) -> T {
@@ -131,54 +101,178 @@ pub struct DoneResp {
     pub duration: Duration,
 }
 
-#[derive(Debug, Clone)]
-pub enum WorkGenerator {
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Work {
     Immediate,
-    BusyWork { range_start: u64, range_end: u64 },
-    BusyWorkConst { mean: u64 },
-    Memory { range_start: u64, range_end: u64 },
-    MemoryConst { mean: u64 },
+    BusyWork(u64),
+    Memory(u64),
 }
 
-impl WorkGenerator {
-    pub fn new(w: Work, disparity: usize) -> Self {
-        match (w, disparity) {
-            (Work::Immediate, _) => Self::Immediate,
-            (Work::BusyWork(mean), 0) => Self::BusyWorkConst { mean },
-            (Work::BusyWork(mean), disparity) => {
-                let range_start = mean - ((disparity / 2) as u64);
-                Self::BusyWork {
-                    range_start,
-                    range_end: range_start + disparity as u64,
+/// Work specification that can be constructed from a string.
+///
+/// The work string specifies the type and amount of work. If nonzero, the amount of work can be
+/// distributed uniformly over one (unimodal) or two (bimodal) ranges.
+///
+/// ```rust,no_run
+/// use datapath_bench::WorkGenerator;
+/// // no work.
+/// let _: WorkGenerator = "imm".parse().unwrap();
+/// // exactly 39 random memory accesses in a large array per request
+/// let _: WorkGenerator = "mem:39".parse().unwrap();
+/// // between [500, 1500] square root computations per request
+/// let _: WorkGenerator = "cpu:1000~1000".parse().unwrap();
+/// // either [0, 100] or [1000, 2000] memory accesses per request
+/// let _: WorkGenerator = "mem:50~100:50%1500~1000".parse().unwrap();
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct WorkGenerator {
+    kind: WorkType,
+    distr: WorkDistribution,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkType {
+    Immediate,
+    Cpu,
+    Memory,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkDistribution {
+    Unimodal(Distr),
+    Bimodal {
+        first: Distr,
+        first_prob: u8,
+        second: Distr,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Distr {
+    Const { mean: u64 },
+    Uniform { range_start: u64, range_end: u64 },
+}
+
+impl FromStr for Distr {
+    type Err = Report;
+    fn from_str(amount: &str) -> Result<Self, Self::Err> {
+        Ok(if amount.contains('~') {
+            let (m, r) = amount.split_once('~').unwrap(); // we know ~ is present
+            let mean: u64 = m
+                .parse()
+                .wrap_err(eyre!("Parsing uniform distribution mean: {:?}", m))?;
+            let range: u64 = r
+                .parse()
+                .wrap_err(eyre!("Parsing uniform distribution range: {:?}", r))?;
+            if range > 1 {
+                Distr::Uniform {
+                    range_start: mean.saturating_sub(range / 2),
+                    range_end: mean + (range / 2),
                 }
+            } else {
+                Distr::Const { mean }
             }
-            (Work::Memory(mean), 0) => Self::MemoryConst { mean },
-            (Work::Memory(mean), disparity) => {
-                let range_start = mean - ((disparity / 2) as u64);
-                Self::Memory {
-                    range_start,
-                    range_end: range_start + disparity as u64,
-                }
+        } else {
+            Distr::Const {
+                mean: amount
+                    .parse()
+                    .wrap_err("Parsing constant distribution work amount")?,
             }
+        })
+    }
+}
+
+impl Distr {
+    fn get(&self, rng: &mut ThreadRng) -> u64 {
+        match self {
+            Distr::Const { mean } => *mean,
+            Distr::Uniform {
+                range_start,
+                range_end,
+            } => rng.gen_range(*range_start..*range_end),
         }
+    }
+}
+
+impl FromStr for WorkGenerator {
+    type Err = Report;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sp: Vec<_> = s.split(':').collect();
+        let kind = match sp[0] {
+            "immediate" | "imm" => WorkType::Immediate,
+            "sqrts" | "cpu" => WorkType::Cpu,
+            "memory" | "mem" => WorkType::Memory,
+            x => {
+                bail!("Could not parse work type: {:?}", x)
+            }
+        };
+
+        let distr = match &sp[1..] {
+            [amount] => WorkDistribution::Unimodal(amount.parse()?),
+            [amount1, amount2] => {
+                let (pct1, first) = match amount1.split_once('%') {
+                    None => (None, amount1.parse()?),
+                    Some((pct, amt)) => (Some(pct.parse()?), amt.parse()?),
+                };
+
+                let (pct2, second): (Option<u8>, _) = match amount2.split_once('%') {
+                    None => (None, amount2.parse()?),
+                    Some((pct, amt)) => (Some(pct.parse()?), amt.parse()?),
+                };
+
+                let first_prob = match (pct1, pct2) {
+                    (Some(n1), Some(n2)) if n1 + n2 == 100 => n1,
+                    (Some(n), None) if n < 100 => n,
+                    (None, Some(n)) if n < 100 => (100 - n),
+                    (None, None) => 50,
+                    x => bail!("Bimodal percentages must sum to 100%: {:?}", x),
+                };
+
+                WorkDistribution::Bimodal {
+                    first,
+                    first_prob,
+                    second,
+                }
+            }
+            x => {
+                bail!("Could not parse work distribution: {:?}", x)
+            }
+        };
+
+        info!(?kind, ?distr, "parsed request work");
+        Ok(Self { kind, distr })
     }
 }
 
 impl Iterator for WorkGenerator {
     type Item = Work;
     fn next(&mut self) -> Option<Self::Item> {
-        Some(match self {
-            WorkGenerator::Immediate => Work::Immediate,
-            WorkGenerator::BusyWork {
-                range_start,
-                range_end,
-            } => Work::BusyWork(rand::thread_rng().gen_range(*range_start..*range_end)),
-            WorkGenerator::Memory {
-                range_start,
-                range_end,
-            } => Work::Memory(rand::thread_rng().gen_range(*range_start..*range_end)),
-            WorkGenerator::BusyWorkConst { mean } => Work::BusyWork(*mean),
-            WorkGenerator::MemoryConst { mean } => Work::Memory(*mean),
+        if let WorkType::Immediate = self.kind {
+            return Some(Work::Immediate);
+        }
+
+        let mut rng = rand::thread_rng();
+        let amt = match self.distr {
+            WorkDistribution::Unimodal(d) => d.get(&mut rng),
+            WorkDistribution::Bimodal {
+                first,
+                first_prob,
+                second,
+            } => {
+                let flip: u8 = rng.gen_range(0..100);
+                if flip < first_prob {
+                    first.get(&mut rng)
+                } else {
+                    second.get(&mut rng)
+                }
+            }
+        };
+
+        Some(match self.kind {
+            WorkType::Cpu => Work::BusyWork(amt),
+            WorkType::Memory => Work::Memory(amt),
+            _ => unreachable!(),
         })
     }
 }

@@ -1,0 +1,14 @@
+[machines]
+server = { access = "127.0.0.1", alt = "192.168.1.2", exp = "10.1.1.2" }
+clients = [
+    { access = "192.168.1.6", exp = "10.1.1.6" },
+]
+
+[exp]
+load = [10000, 40000, 80000, 100000, 160000, 200000]
+work = ['imm', 'cpu:1000~0', 'mem:1000', 'cpu:1000~500', 'mem:1000~500', 'cpu:50~50:1500~1000', 'mem:50~50:50%1500~1000']
+num_clients = [1, 4]
+req_padding = [0, 1024]
+datapath = ['dpdkinline', 'dpdk', 'shenango']
+time_target_s = 30
+iters = 3

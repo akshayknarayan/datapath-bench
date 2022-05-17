@@ -1,6 +1,4 @@
-use super::{
-    write_results, AsyncSpinTimer, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator,
-};
+use super::{write_results, AsyncSpinTimer, Client, DoneResp, Req, Resp, Server, Work};
 use color_eyre::eyre::{ensure, eyre, Report, WrapErr};
 use dpdk_wrapper::DpdkConn;
 use futures_util::stream::StreamExt;
@@ -126,13 +124,11 @@ pub fn dpdk_client(
         num_reqs,
         conn_count,
         load_req_per_s,
-        req_work_type,
-        req_work_disparity,
+        work_gen,
         req_padding_size,
     }: Client,
 ) -> Result<(), Report> {
     let clk = quanta::Clock::new();
-    let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
 
     let rt = tokio::runtime::Builder::new_multi_thread()

@@ -1,4 +1,4 @@
-use super::{write_results, Client, DoneResp, Req, Resp, Server, Work, WorkGenerator};
+use super::{write_results, Client, DoneResp, Req, Resp, Server, Work};
 use color_eyre::eyre::{ensure, Report, WrapErr};
 use shenango::sync::Mutex;
 use shenango::udp::{self, UdpConnection};
@@ -115,12 +115,10 @@ fn shenango_client_inner(
         num_reqs,
         conn_count,
         load_req_per_s,
-        req_work_type,
-        req_work_disparity,
+        work_gen,
         req_padding_size,
     }: Client,
 ) -> Result<Vec<DoneResp>, Report> {
-    let work_gen = WorkGenerator::new(req_work_type, req_work_disparity);
     let req_interarrival = Duration::from_secs_f64(conn_count as f64 / (load_req_per_s as f64));
 
     let (done_s, done_r) = flume::bounded(conn_count);

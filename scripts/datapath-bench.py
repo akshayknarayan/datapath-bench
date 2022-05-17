@@ -55,7 +55,7 @@ def start_server(conn, outf, num_threads, variant='dpdk'):
     time.sleep(8)
     conn.check_proc(f"datapath", f"{outf}.err")
 
-def run_client(conn, server, load, num_clients, num_reqs, work_type, work_disparity, req_padding, variant, outf):
+def run_client(conn, server, load, num_clients, num_reqs, work, req_padding, variant, outf):
     conn.run("sudo pkill -9 datapath-bench")
     if 'shenango' in variant:
         conn.run("sudo pkill -INT iokerneld")
@@ -78,8 +78,7 @@ def run_client(conn, server, load, num_clients, num_reqs, work_type, work_dispar
         --load-req-per-s {load} \
         --conn-count {num_clients} \
         --num-reqs {num_reqs} \
-        --req-work-type {work_type} \
-        --req-work-disparity {work_disparity} \
+        --work-gen {work} \
         --req-padding-size {req_padding} \
         ",
         sudo=True,
@@ -98,8 +97,7 @@ def do_exp(iter_num,
     load=None,
     num_clients=None,
     num_reqs=None,
-    work_type=None,
-    work_disparity=None,
+    work=None,
     req_padding=None,
     datapath=None,
     overwrite=None
@@ -110,16 +108,15 @@ def do_exp(iter_num,
         load is not None and
         num_clients is not None and
         num_reqs is not None and
-        work_type is not None and
-        work_disparity is not None and
+        work is not None and
         req_padding is not None and
         num_clients is not None and
         datapath is not None and
         overwrite is not None
     )
 
-    server_prefix = f"{outdir}/{datapath}-load={load}-work={work_type}-disparity={work_disparity}-num_clients={num_clients}-padding={req_padding}-{iter_num}-dbench_server"
-    outf = f"{outdir}/{datapath}-load={load}-work={work_type}-disparity={work_disparity}-num_clients={num_clients}-padding={req_padding}-{iter_num}-dbench_client"
+    server_prefix = f"{outdir}/{datapath}-load={load}-work={work}-num_clients={num_clients}-padding={req_padding}-{iter_num}-dbench_server"
+    outf = f"{outdir}/{datapath}-load={load}-work={work}-num_clients={num_clients}-padding={req_padding}-{iter_num}-dbench_client"
 
     for m in machines:
         if m.local:
@@ -151,8 +148,7 @@ def do_exp(iter_num,
             load,
             num_clients,
             num_reqs,
-            work_type,
-            work_disparity,
+            work,
             req_padding,
             datapath,
             outf,
@@ -244,9 +240,17 @@ if __name__ == '__main__':
         agenda.failure("Need more machines")
         sys.exit(1)
 
-    required = ['load', 'work_type', 'work_disparity', 'iters']
+    required = ['load', 'work', 'iters']
     for r in required:
         assert(r in cfg['exp'])
+
+    def normalize_work_str(w):
+        if '~0' in w:
+            w = w.replace('~0', '')
+        if '50%' in w:
+            w = w.replace('50%', '')
+        return w
+    cfg['exp']['work'] = [normalize_work_str(w) for w in cfg['exp']['work']]
 
     if 'num_clients' not in cfg['exp']:
         cfg['exp']['num_clients'] = [1]
@@ -289,28 +293,23 @@ if __name__ == '__main__':
     # copy config file to outdir
     shutil.copy2(args.config, args.outdir)
 
-    for dp in cfg['exp']['datapath']:
-        for nc in cfg['exp']['num_clients']:
-            for w in cfg['exp']['work_type']:
-                for d in cfg['exp']['work_disparity']:
-                    if w == 'imm' and int(d) != 0:
-                        agenda.subtask('skipping nonzero disparity for imm work')
-                        continue
+    for i in range(int(cfg['exp']['iters'])):
+        for dp in cfg['exp']['datapath']:
+            for nc in cfg['exp']['num_clients']:
+                for w in cfg['exp']['work']:
                     for p in cfg['exp']['req_padding']:
                         for l in cfg['exp']['load']:
                             nr = int(cfg['exp']['time_target_s']) * int(l)
-                            for i in range(int(cfg['exp']['iters'])):
-                                do_exp(i,
-                                        outdir=outdir,
-                                        machines=machines,
-                                        load=l,
-                                        num_clients=nc,
-                                        num_reqs=nr,
-                                        work_type=w,
-                                        work_disparity=d,
-                                        req_padding=p,
-                                        datapath=dp,
-                                        overwrite=args.overwrite
-                                        )
+                            do_exp(i,
+                                    outdir=outdir,
+                                    machines=machines,
+                                    load=l,
+                                    num_clients=nc,
+                                    num_reqs=nr,
+                                    work=w,
+                                    req_padding=p,
+                                    datapath=dp,
+                                    overwrite=args.overwrite
+                                    )
 
     agenda.task("done")
