@@ -208,6 +208,13 @@ impl FromStr for WorkGenerator {
             }
         };
 
+        if let WorkType::Immediate = kind {
+            return Ok(Self {
+                kind,
+                distr: WorkDistribution::Unimodal(Distr::Const { mean: 0 }),
+            });
+        }
+
         let distr = match &sp[1..] {
             [amount] => WorkDistribution::Unimodal(amount.parse()?),
             [amount1, amount2] => {
