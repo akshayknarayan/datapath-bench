@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-dpdk-wrapper = { path = "../dpdk-direct/dpdk-wrapper" }
-shenango = { path = "../shenango-chunnel/caladan/bindings/rust" }
+dpdk-wrapper = { path = "./dpdk-wrapper" }
+shenango = { path = "./caladan/bindings/rust" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
 color-eyre = "0.5"
 tracing = "0.1"
@@ -22,3 +22,7 @@ quanta = "0.9"
 eui48 = "1"
 toml = "0.5"
 ahash = "0.7"
+
+[profile.release]
+debug = true
+lto = true

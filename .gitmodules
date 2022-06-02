@@ -1,0 +1,6 @@
+[submodule "dpdk-wrapper"]
+	path = dpdk-wrapper
+	url = https://github.com/akshayknarayan/dpdk-wrapper
+[submodule "caladan"]
+	path = caladan
+	url = https://github.com/akshayknarayan/caladan
