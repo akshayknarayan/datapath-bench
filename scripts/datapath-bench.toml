@@ -1,7 +1,7 @@
 [machines]
-server = { access = "127.0.0.1", alt = "192.168.1.2", exp = "10.1.1.2" }
+server = { access = "127.0.0.1", alt = "192.168.1.6", exp = "10.1.1.6" }
 clients = [
-    { access = "192.168.1.6", exp = "10.1.1.6" },
+    { access = "192.168.1.5", exp = "10.1.1.5" },
 ]
 
 [exp]

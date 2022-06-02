@@ -3,6 +3,7 @@
 from kv import ConnectionWrapper, check_machine, get_local, check, get_timeout, write_dpdk_config, write_cfg
 import agenda
 import argparse
+import glob
 import os
 import shutil
 import subprocess
@@ -125,7 +126,7 @@ def do_exp(iter_num,
         m.run(f"rm -rf {outdir}", wd="~/burrito")
         m.run(f"mkdir -p {outdir}", wd="~/burrito")
 
-    if not overwrite and os.path.exists(f"{outf}-{machines[1].addr}.data"):
+    if not overwrite and len(glob.glob(f"{outf}-*.data")) > 0:
         agenda.task(f"skipping: {outf}.data")
         return True
     else:
